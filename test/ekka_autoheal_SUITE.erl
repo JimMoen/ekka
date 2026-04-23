@@ -190,3 +190,323 @@ init_app_envs(N) ->
                      ]
               }],
     rpc:call(N, application, set_env, [Config]).
+
+%%--------------------------------------------------------------------
+%% heal_node/1 single-rpc unit tests
+%%--------------------------------------------------------------------
+
+%% Verifies that ekka_autoheal:heal_node/1 invokes ekka_cluster:heal/1 with
+%% the single atom shutdown_and_reboot (single-rpc path) and does not crash.
+%% The slave runs the real ekka_cluster, so the clause must exist and return ok.
+t_heal_single_rpc(_Config) ->
+    Node = start_slave_node(sr1),
+    try
+        %% Direct rpc validates the clause exists and returns ok.
+        %% heal(shutdown_and_reboot) on a standalone slave:
+        %%   prepare(heal) -> announce + application:stop(ekka)
+        %%   reboot()      -> ekka:start()
+        %% The slave ends up running ekka again.
+        ok = rpc:call(Node, ekka_cluster, heal, [shutdown_and_reboot], 30000),
+        ok = ekka_ct:wait_running(Node),
+        true = ekka:is_running(Node, ekka),
+        %% Invoke heal_node/1 proper and verify it completes without crash.
+        %% Return value is not contractual; we only care that it doesn't raise.
+        _ = ekka_autoheal:heal_node(Node),
+        ok = ekka_ct:wait_running(Node),
+        true = ekka:is_running(Node, ekka)
+    after
+        ekka_ct:stop_slave(Node)
+    end.
+
+%% Verifies that a 2-node cluster is fully re-joined at mnesia level after
+%% one peer executes heal(shutdown_and_reboot). This is a regression guard:
+%% an earlier draft of heal/1 that omitted ekka_mnesia:ensure_stopped/started
+%% left both nodes alive with only self in running_nodes (i.e. mnesia schema
+%% never re-joined the cluster).
+t_heal_restores_mnesia_running_nodes(_Config) ->
+    [N1, N2] = Nodes = lists:map(fun start_slave_node/1, [mr1, mr2]),
+    try
+        %% Form a 2-node cluster.
+        ok = rpc:call(N2, ekka, join, [N1]),
+        true = lists:sort(rpc:call(N1, ekka_mnesia, running_nodes, [])) =:=
+               lists:sort(Nodes),
+        true = lists:sort(rpc:call(N2, ekka_mnesia, running_nodes, [])) =:=
+               lists:sort(Nodes),
+        %% Have N2 perform the atomic heal locally.
+        %% Success contract: after this call, mnesia schema on N2 has
+        %% re-joined the cluster (not running as a detached singleton).
+        ok = rpc:call(N2, ekka_cluster, heal, [shutdown_and_reboot], 30000),
+        ok = ekka_ct:wait_running(N2),
+        true = ekka:is_running(N2, ekka),
+        %% Both nodes must see each other in mnesia running_nodes again.
+        ?assertEqual(lists:sort(Nodes),
+                     lists:sort(rpc:call(N1, ekka_mnesia, running_nodes, []))),
+        ?assertEqual(lists:sort(Nodes),
+                     lists:sort(rpc:call(N2, ekka_mnesia, running_nodes, [])))
+    after
+        lists:foreach(fun ekka_ct:stop_slave/1, Nodes)
+    end.
+
+%% Integration test: full autoheal GenServer path on a 2-node cluster
+%% ends with mnesia cluster fully re-joined on BOTH nodes.
+%%
+%% This is the end-to-end guard for the regression where an earlier draft
+%% of heal(shutdown_and_reboot) skipped the ekka_mnesia stop/start pair
+%% and left the victim's mnesia schema as a detached singleton after the
+%% autoheal completed (ekka layer looked healthy, but
+%% ekka_mnesia:running_nodes/0 returned just self on each node).
+%%
+%% Trigger is net_kernel:disconnect (not a direct ekka_cluster:heal/1 call),
+%% so the autoheal GenServer drives the whole chain:
+%%   partition detected -> split view computed -> coordinator picks victim
+%%   -> rpc to victim's ekka_cluster:heal(shutdown_and_reboot)
+%%   -> victim runs prepare(heal), ensure_stopped, ensure_started, reboot
+%%   -> mnesia schema re-joins the cluster peer
+%%
+%% Failure mode if regression returns: ekka running_nodes eventually shows
+%% both, but ekka_mnesia:running_nodes/0 stays at [self()] on each side.
+t_autoheal_restores_mnesia(_Config) ->
+    [N1, N2] = Nodes = lists:map(fun start_slave_node/1, [ahm1, ahm2]),
+    try
+        %% Form a 2-node cluster and sanity-check both layers are in sync.
+        ok = rpc:call(N2, ekka, join, [N1]),
+        ?assertEqual(lists:sort(Nodes),
+                     lists:sort(rpc:call(N1, ekka_mnesia, running_nodes, []))),
+        ?assertEqual(lists:sort(Nodes),
+                     lists:sort(rpc:call(N2, ekka_mnesia, running_nodes, []))),
+        ?check_trace(
+            begin
+                %% Symmetric 2-node netsplit. Autoheal picks a coordinator
+                %% deterministically (the node with the lexicographically
+                %% smaller running-nodes list) and rpcs heal into the peer.
+                true = rpc:cast(N1, net_kernel, disconnect, [N2]),
+                ok = timer:sleep(1000),
+                %% Each side now sees only itself.
+                [N1] = rpc:call(N1, ekka, info, [running_nodes]),
+                [N2] = rpc:call(N1, ekka, info, [stopped_nodes]),
+                [N2] = rpc:call(N2, ekka, info, [running_nodes]),
+                [N1] = rpc:call(N2, ekka, info, [stopped_nodes]),
+                %% Wait for the autoheal GenServer to drive the full chain.
+                ok = timer:sleep(12000),
+                %% Ekka membership view recovered on both nodes.
+                ?assertEqual(lists:sort(Nodes),
+                             lists:sort(rpc:call(N1, ekka, info, [running_nodes]))),
+                ?assertEqual(lists:sort(Nodes),
+                             lists:sort(rpc:call(N2, ekka, info, [running_nodes]))),
+                %% Mnesia cluster view also recovered on both nodes.
+                %% This is the specific assertion that would fail if the
+                %% ensure_stopped/started pair were missing from
+                %% heal(shutdown_and_reboot).
+                ?assertEqual(lists:sort(Nodes),
+                             lists:sort(rpc:call(N1, ekka_mnesia, running_nodes, []))),
+                ?assertEqual(lists:sort(Nodes),
+                             lists:sort(rpc:call(N2, ekka_mnesia, running_nodes, [])))
+            end,
+            fun(Trace) ->
+                ?assertMatch(
+                    [#{need_reboot := [_]} | _],
+                    ?of_kind("Healing cluster partition", Trace)
+                )
+            end
+        )
+    after
+        lists:foreach(fun ekka_ct:stop_slave/1, Nodes),
+        snabbkaffe:stop()
+    end.
+
+%% Verifies that heal_node/1 uses a 30s timeout (not infinity) on every rpc:call.
+%% A live-timeout test would burn 30s of CI wall-clock, so we inspect the
+%% source to ensure the bounded timeout is present and infinity is absent
+%% within the heal_node/1 function body.
+t_heal_timeout_30s(_Config) ->
+    SrcPath = locate_ekka_autoheal_src(),
+    {ok, Bin} = file:read_file(SrcPath),
+    Src = binary_to_list(Bin),
+    FunText = extract_heal_node_body(Src),
+    %% Must contain bounded 30s timeout on rpc:call.
+    ?assertNotEqual(nomatch, string:find(FunText, ", 30000)")),
+    %% Must NOT use infinity timeout anywhere in heal_node/1.
+    ?assertEqual(nomatch, string:find(FunText, "infinity")),
+    ok.
+
+locate_ekka_autoheal_src() ->
+    {ok, Cwd} = file:get_cwd(),
+    Candidates0 = [
+        filename:join([Cwd, "src", "ekka_autoheal.erl"]),
+        filename:join([Cwd, "..", "src", "ekka_autoheal.erl"]),
+        filename:join([Cwd, "..", "..", "src", "ekka_autoheal.erl"]),
+        filename:join([Cwd, "..", "..", "..", "src", "ekka_autoheal.erl"]),
+        filename:join([Cwd, "..", "..", "..", "..", "src", "ekka_autoheal.erl"])
+    ],
+    Candidates = case code:lib_dir(ekka) of
+                     {error, _} -> Candidates0;
+                     LibDir     -> Candidates0 ++
+                                   [filename:join([LibDir, "src",
+                                                   "ekka_autoheal.erl"])]
+                 end,
+    case [P || P <- Candidates, filelib:is_regular(P)] of
+        [Found | _] -> Found;
+        []          -> error({ekka_autoheal_src_not_found, Candidates})
+    end.
+
+extract_heal_node_body(Src) ->
+    Marker = "heal_node(Node) ->",
+    case string:find(Src, Marker) of
+        nomatch ->
+            error(heal_node_marker_not_found);
+        Tail ->
+            %% Stop at the next top-level form: a blank line followed by a
+            %% non-whitespace character (start of another function or clause
+            %% group). "\n\n" is the boundary used throughout this module.
+            case string:find(Tail, "\n\n") of
+                nomatch -> Tail;
+                Rest    ->
+                    Len = string:length(Tail) - string:length(Rest),
+                    string:slice(Tail, 0, Len)
+            end
+    end.
+
+%% Verifies the legacy fallback branch: if the peer only supports
+%% heal(shutdown) / heal(reboot) (old ekka), heal_node/1 catches the
+%% function_clause from heal(shutdown_and_reboot) and invokes both legacy rpcs.
+%% We install a shim ekka_cluster module on the slave that only exports
+%% the two legacy clauses and records invocations in an ETS table.
+t_heal_legacy_fallback(_Config) ->
+    Node = start_slave_node(lf1),
+    try
+        %% Compile shim module that records calls and lacks shutdown_and_reboot.
+        ShimForms = legacy_shim_forms(),
+        {ok, ekka_cluster, ShimBin} = compile:forms(ShimForms, [return_errors]),
+        %% Stop real ekka on slave so swapping its cluster module is safe.
+        ok = rpc:call(Node, application, stop, [ekka]),
+        %% Swap ekka_cluster with the legacy shim.
+        true = rpc:call(Node, code, delete, [ekka_cluster]),
+        _ = rpc:call(Node, code, purge, [ekka_cluster]),
+        {module, ekka_cluster} =
+            rpc:call(Node, code, load_binary,
+                     [ekka_cluster, "ekka_cluster.erl", ShimBin]),
+        %% Prime the ETS tracker on the slave. The table must outlive this
+        %% rpc:call (otherwise it would die with the rpc worker process), so
+        %% we spawn a long-lived owner on the slave and have it create the
+        %% table. Any process on the slave can then ets:insert into it
+        %% (public, named_table).
+        _Owner = rpc:call(Node, erlang, spawn,
+                          [fun() ->
+                               ets:new(heal_calls,
+                                       [public, named_table, bag]),
+                               receive stop -> ok end
+                           end]),
+        %% Wait until the table is visible to other processes on the slave.
+        ok = wait_until(
+               fun() ->
+                   rpc:call(Node, ets, info, [heal_calls, size]) =/= undefined
+               end, 50),
+        %% Invoke heal_node/1 — should hit function_clause, fall back.
+        _ = ekka_autoheal:heal_node(Node),
+        %% Verify both legacy rpcs ran on the slave.
+        Calls = rpc:call(Node, ets, tab2list, [heal_calls]),
+        ?assert(lists:member({call, shutdown}, Calls)),
+        ?assert(lists:member({call, reboot}, Calls)),
+        ?assertNot(lists:member({call, shutdown_and_reboot}, Calls))
+    after
+        ekka_ct:stop_slave(Node)
+    end.
+
+%%--------------------------------------------------------------------
+%% rejoin_peers_loop/3 unit tests
+%%
+%% These exercise the post-reboot rejoin loop in isolation (no slave
+%% nodes / no real mnesia). We mock ekka_mnesia:cluster_nodes and
+%% ekka_mnesia:connect with meck and assert the loop's behaviour on
+%% its three branches: fast success, timeout, and recursion.
+%%--------------------------------------------------------------------
+
+%% When every peer is already in running_db_nodes, the loop returns ok
+%% immediately without calling connect/1.
+t_rejoin_peers_loop_fast_ok(_Config) ->
+    Peers = ['a@h', 'b@h'],
+    ok = meck:new(ekka_mnesia, [passthrough]),
+    ok = meck:expect(ekka_mnesia, cluster_nodes,
+                     fun(running) -> Peers; (all) -> Peers end),
+    ok = meck:expect(ekka_mnesia, connect, fun(_) -> ok end),
+    try
+        ?assertEqual(ok, ekka_cluster:rejoin_peers_loop(Peers, 10, 1)),
+        ?assertEqual(0, meck:num_calls(ekka_mnesia, connect, '_'))
+    after
+        meck:unload(ekka_mnesia)
+    end.
+
+%% When no peer ever joins running_db_nodes, the loop exhausts its
+%% retry budget and returns {error, rejoin_timeout}. It must have
+%% tried to connect on every iteration.
+t_rejoin_peers_loop_timeout(_Config) ->
+    Peers = ['a@h'],
+    ok = meck:new(ekka_mnesia, [passthrough]),
+    ok = meck:expect(ekka_mnesia, cluster_nodes, fun(running) -> [] end),
+    ok = meck:expect(ekka_mnesia, connect, fun(_) -> {error, not_reachable} end),
+    try
+        ?assertEqual({error, rejoin_timeout},
+                     ekka_cluster:rejoin_peers_loop(Peers, 3, 1)),
+        ?assertEqual(3, meck:num_calls(ekka_mnesia, connect, '_'))
+    after
+        meck:unload(ekka_mnesia)
+    end.
+
+%% Peer is missing on first check, joins before retries run out.
+%% Loop must call connect at least once and return ok.
+t_rejoin_peers_loop_eventually_ok(_Config) ->
+    Peers = ['a@h'],
+    Counter = counters:new(1, [atomics]),
+    ok = meck:new(ekka_mnesia, [passthrough]),
+    ok = meck:expect(ekka_mnesia, cluster_nodes,
+                     fun(running) ->
+                             N = counters:get(Counter, 1),
+                             counters:add(Counter, 1, 1),
+                             case N < 2 of
+                                 true -> [];
+                                 false -> Peers
+                             end
+                     end),
+    ok = meck:expect(ekka_mnesia, connect, fun(_) -> ok end),
+    try
+        ?assertEqual(ok, ekka_cluster:rejoin_peers_loop(Peers, 10, 1)),
+        ?assert(meck:num_calls(ekka_mnesia, connect, '_') >= 1)
+    after
+        meck:unload(ekka_mnesia)
+    end.
+
+%% Abstract forms for a legacy-shape ekka_cluster shim:
+%%   -module(ekka_cluster).
+%%   -export([heal/1]).
+%%   heal(shutdown) -> ets:insert(heal_calls, {call, shutdown}), ok;
+%%   heal(reboot)   -> ets:insert(heal_calls, {call, reboot}), ok.
+legacy_shim_forms() ->
+    Src = "-module(ekka_cluster).\n"
+          "-export([heal/1]).\n"
+          "heal(shutdown) ->\n"
+          "    ets:insert(heal_calls, {call, shutdown}), ok;\n"
+          "heal(reboot) ->\n"
+          "    ets:insert(heal_calls, {call, reboot}), ok.\n",
+    {ok, Toks, _} = erl_scan:string(Src),
+    FormTokens = split_forms(Toks, [], []),
+    [begin {ok, F} = erl_parse:parse_form(Ts), F end || Ts <- FormTokens].
+
+split_forms([], [], Acc) ->
+    lists:reverse(Acc);
+split_forms([], _Cur, Acc) ->
+    %% Trailing tokens without a dot: ignore (shouldn't happen for valid src).
+    lists:reverse(Acc);
+split_forms([{dot, _} = D | Rest], Cur, Acc) ->
+    split_forms(Rest, [], [lists:reverse([D | Cur]) | Acc]);
+split_forms([T | Rest], Cur, Acc) ->
+    split_forms(Rest, [T | Cur], Acc).
+
+%% Poll Fun/0 until it returns true or Retries attempts have elapsed.
+%% Sleep 50ms between attempts. Returns ok on success, errors on timeout.
+wait_until(_Fun, 0) ->
+    error({wait_until, timeout});
+wait_until(Fun, Retries) when Retries > 0 ->
+    case Fun() of
+        true  -> ok;
+        _     -> timer:sleep(50), wait_until(Fun, Retries - 1)
+    end.
