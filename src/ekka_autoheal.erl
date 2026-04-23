@@ -24,6 +24,11 @@
         , handle_msg/2
         ]).
 
+-ifdef(TEST).
+%% Exported for test-suite access only. Not part of the public API.
+-export([heal_node/1]).
+-endif.
+
 -record(autoheal, {delay, role, proc, timer}).
 
 -type autoheal() :: #autoheal{}.
@@ -203,18 +208,22 @@ heal_partition([{Majority, Minority}, {Minority, Majority}] = SplitView) ->
     reboot_minority(Minority).
 
 reboot_minority(Minority) ->
-    lists:foreach(fun shutdown/1, Minority),
-    timer:sleep(rand:uniform(1000) + 100),
-    lists:foreach(fun reboot/1, Minority),
+    lists:foreach(fun heal_node/1, Minority),
     Minority.
 
-shutdown(Node) ->
-    Ret = rpc:call(Node, ekka_cluster, heal, [shutdown]),
-    ?LOG(critical, "Shutdown ~s for autoheal: ~p", [Node, Ret]).
-
-reboot(Node) ->
-    Ret = rpc:call(Node, ekka_cluster, heal, [reboot]),
-    ?LOG(critical, "Reboot ~s for autoheal: ~p", [Node, Ret]).
+heal_node(Node) ->
+    case rpc:call(Node, ekka_cluster, heal, [shutdown_and_reboot], 30000) of
+        {badrpc, {'EXIT', {function_clause, _}}} ->
+            %% Old ekka on peer — fallback to legacy two-rpc path
+            ?LOG(warning, "Heal ~s: peer has legacy ekka; using two-rpc fallback", [Node]),
+            LegShutdown = rpc:call(Node, ekka_cluster, heal, [shutdown], 30000),
+            ?LOG(critical, "Shutdown ~s for autoheal (legacy): ~p", [Node, LegShutdown]),
+            timer:sleep(rand:uniform(1000) + 100),
+            LegReboot = rpc:call(Node, ekka_cluster, heal, [reboot], 30000),
+            ?LOG(critical, "Reboot ~s for autoheal (legacy): ~p", [Node, LegReboot]);
+        Ret ->
+            ?LOG(critical, "Heal ~s for autoheal: ~p", [Node, Ret])
+    end.
 
 ensure_cancel_timer(undefined) ->
     ok;
